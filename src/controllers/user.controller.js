@@ -3,6 +3,24 @@ import { ApiError } from "../utils/ApiError.js";
 import { User } from "../models/user.model.js";
 import { uploadOnCloudinary } from "../utils/cloudinary.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
+import jwt from "jsonwebtoken";
+
+const generateAccessAndRefreshTokens = async (userId) => {
+  try {
+    const user = await User.findById(userId);
+    const accessToken = user.generateAccessToken();
+    const refreshToken = user.generateRefreshToken();
+    user.refreshToken = refreshToken;
+    await user.save({ validateBeforeSave: false });
+
+    return { accessToken, refreshToken };
+  } catch (error) {
+    throw new ApiError(
+      500,
+      "Something went wrong while generating refresh & access token"
+    );
+  }
+};
 
 const registerUser = asynchandler(async (req, res) => {
   // get user details from frontend
@@ -68,4 +86,114 @@ const registerUser = asynchandler(async (req, res) => {
     .json(new ApiResponse(200, createdUser, "user Registered"));
 });
 
-export { registerUser };
+const loginUser = asynchandler(async (req, res) => {
+  // req body -> data
+  // check username or email
+  // find the user
+  // if found -> then password check
+  // if checked -> generate access & refresh token
+  // send cookie
+
+  const { email, username, password } = req.body;
+  if (!(username || email)) {
+    throw new ApiError(400, "Username or Email required");
+  }
+
+  const user = await User.findOne({
+    $or: [{ username }, { email }],
+  });
+  if (!user) {
+    throw new ApiError(404, "User doesn't exist");
+  }
+  const isPasswordValid = await user.isPasswordCorrect(password);
+  if (!isPasswordValid) {
+    throw new ApiError(401, "Password Incorrect");
+  }
+
+  const { accessToken, refreshToken } = await generateAccessAndRefreshTokens(
+    user._id
+  );
+
+  const loggedInUser = await User.findById(user._id).select(
+    "-password -refreshToken"
+  );
+
+  const options = { httpOnly: true, secure: true };
+  return res
+    .status(200)
+    .cookie("accessToken", accessToken, options)
+    .cookie("refreshToken", refreshToken, options)
+    .json(
+      new ApiResponse(
+        200,
+        {
+          user: loggedInUser,
+          accessToken,
+          refreshToken,
+        },
+        "User Logged in SuccessFully"
+      )
+    );
+});
+
+const loggedOutUser = asynchandler(async (req, res) => {
+  await User.findByIdAndUpdate(
+    req.user._id,
+    {
+      $set: { refreshToken: undefined },
+    },
+    {
+      new: true,
+    }
+  );
+  const options = { httpOnly: true, secure: true };
+
+  return res
+    .status(200)
+    .clearCookie("accessToken", options)
+    .clearCookie("refreshToken", options)
+    .json(new ApiResponse(200, {}, "User Logged Out SuccessFully"));
+});
+
+const refreshAccessToken = asynchandler(async (req, res) => {
+  const incomigRefreshToken = req.cookies.refreshToken || req.body.refreshToken;
+  if (!incomigRefreshToken) {
+    throw new ApiError(401, "Unauthorized Request");
+  }
+  try {
+    const decodedToken = jwt.verify(
+      incomigRefreshToken,
+      process.env.REFRESH_TOKEN_SECRET
+    );
+
+    const user = await User.findById(decodedToken?._id);
+    if (!user) {
+      throw new ApiError(401, "Invalid refresh token");
+    }
+    if (incomigRefreshToken !== user?.refreshToken) {
+      throw new ApiError(401, "Refresh Token Expired or Used");
+    }
+
+    const { accessToken, newrefreshToken } =
+      await generateAccessAndRefreshTokens(user._id);
+    const options = {
+      httpOnly: true,
+      secure: true,
+    };
+    return res
+      .status(200)
+      .cookie("accessToken", accessToken, options)
+      .cookie("refreshToken", newrefreshToken, options)
+      .json(
+        new ApiResponse(
+          200,
+          { accessToken, refreshToken: newrefreshToken },
+          "Access Token Refreshed"
+        )
+      );
+  } catch (error) {
+    throw new ApiError(401, error?.message || "Invalid Refresh Token");
+  }
+});
+
+export { registerUser, loginUser, loggedOutUser, refreshAccessToken };
